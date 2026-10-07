@@ -606,16 +606,22 @@ impl CustomScan for AggregateScan {
                 replace_aggrefs,
             } => {
                 builder.set_scanrelid(heap_rti);
+                // #6639: the Params of the search query live only in custom_private, which
+                // `finalize_plan` does not walk. Expose them in custom_exprs so they reach
+                // extParam/allParam. Otherwise a new outer value leaves chgParam NULL on
+                // rescan, and a Hash Join above keeps the hash table of the first value.
+                let params = tantivy_query_params(builder.custom_private_mut());
+                let mut cscan = builder.build();
                 if replace_aggrefs {
                     unsafe {
-                        let mut cscan = builder.build();
                         let plan = &mut cscan.scan.plan;
                         replace_aggrefs_in_target_list(plan);
-                        cscan
                     }
-                } else {
-                    builder.build()
                 }
+                if !params.is_empty() {
+                    cscan.custom_exprs = params.into_pg();
+                }
+                cscan
             }
             PlanShape::DataFusion { clause_count } => {
                 // For join aggregates, scanrelid=0 (no single base relation)
@@ -2694,6 +2700,32 @@ unsafe fn detect_join_aggregate_topk(
     }
 
     None
+}
+
+/// Copies of every `Param` that the Tantivy search query and the aggregates' `FILTER`
+/// queries reference, for `CustomScan.custom_exprs`. Only the `Param`s go there, not the
+/// expressions that hold them: `finalize_plan` only needs the param IDs.
+fn tantivy_query_params(private_data: &mut PrivateData) -> PgList<pg_sys::Node> {
+    let mut params = PgList::<pg_sys::Node>::new();
+    let PrivateData::Tantivy {
+        aggregate_clause, ..
+    } = private_data
+    else {
+        return params;
+    };
+
+    let mut expr_nodes = aggregate_clause.query_mut().collect_expression_nodes();
+    for agg in aggregate_clause.aggregates_mut() {
+        if let Some(filter) = agg.filter_expr_mut() {
+            expr_nodes.extend(filter.collect_expression_nodes());
+        }
+    }
+    for expr_node in expr_nodes {
+        for param in expr_node.collect_nodes::<pg_sys::Param>() {
+            params.push(unsafe { pg_sys::copyObjectImpl(param.cast()) }.cast());
+        }
+    }
+    params
 }
 
 /// Replace any T_Aggref expressions in the target list with T_FuncExpr placeholders
